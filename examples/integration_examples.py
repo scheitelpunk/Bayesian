@@ -8,7 +8,7 @@ import torch.nn as nn
 from typing import Dict, Any, Optional
 from transformers import GPT2Model, BertModel, T5Model, GPT2Config, BertConfig, T5Config
 
-from bayesian_transformer import (
+from src.bayesian_transformer import (
     BayesianExpectationTransformerLayer,
     MartingaleAwareAttention,
     OptimalCoTLayer,

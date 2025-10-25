@@ -7,7 +7,7 @@ sentiment analysis with calibrated uncertainty estimates.
 
 import torch
 import torch.nn as nn
-from bayesian_transformer import (
+from src.bayesian_transformer import (
     BayesianExpectationTransformerLayer,
     MDLRegularizedLoss
 )

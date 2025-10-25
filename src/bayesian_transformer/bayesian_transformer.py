@@ -7,6 +7,56 @@ from collections import OrderedDict
 import numpy as np
 
 
+class LRUPermutationCache:
+    """LRU cache for permutation tensors with size limit to prevent memory leaks."""
+
+    def __init__(self, maxsize: int = 100):
+        """
+        Initialize LRU cache with maximum size.
+
+        Args:
+            maxsize: Maximum number of entries to cache
+        """
+        self.cache: OrderedDict = OrderedDict()
+        self.maxsize = maxsize
+
+    def get(self, key: Tuple[int, int]) -> Optional[torch.Tensor]:
+        """
+        Get cached permutation tensor if it exists.
+
+        Args:
+            key: Tuple of (seq_length, k_permutations)
+
+        Returns:
+            Cached tensor if found, None otherwise
+        """
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key: Tuple[int, int], value: torch.Tensor):
+        """
+        Store permutation tensor in cache with LRU eviction.
+
+        Args:
+            key: Tuple of (seq_length, k_permutations)
+            value: Permutation tensor to cache
+        """
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        else:
+            self.cache[key] = value
+            if len(self.cache) > self.maxsize:
+                # Remove oldest (least recently used)
+                self.cache.popitem(last=False)
+
+    def clear(self):
+        """Clear all cached entries."""
+        self.cache.clear()
+
+
 class MartingaleAwareAttention(nn.Module):
     """
     Martingale-Aware Attention Layer implementing the theoretical insights from
@@ -16,34 +66,34 @@ class MartingaleAwareAttention(nn.Module):
     to reduce martingale violations following Θ(log n/n) convergence.
     """
     
-    def __init__(self, d_model: int, n_heads: int, k_permutations: int = 20, 
-                 dropout: float = 0.1, max_seq_length: int = 2048):
+    def __init__(self, d_model: int, n_heads: int, k_permutations: int = 20,
+                 dropout: float = 0.1, max_seq_length: int = 2048, cache_maxsize: int = 100):
         super().__init__()
-        
+
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.k_permutations = k_permutations
         self.head_dim = d_model // n_heads
         self.scale = self.head_dim ** -0.5
         self.max_seq_length = max_seq_length
-        
+
         # Standard attention components
         self.q_linear = nn.Linear(d_model, d_model)
         self.k_linear = nn.Linear(d_model, d_model)
         self.v_linear = nn.Linear(d_model, d_model)
         self.out_linear = nn.Linear(d_model, d_model)
-        
-        # Permutation averaging components
-        self.perm_cache = {}
+
+        # Permutation averaging components with LRU cache
+        self.perm_cache = LRUPermutationCache(maxsize=cache_maxsize)
         self.variance_reduction_weight = nn.Parameter(torch.ones(1))
-        
+
         # Adaptive weighting based on sequence length
         self.length_adaptive_weight = nn.Parameter(torch.ones(1))
-        
+
         self.dropout = nn.Dropout(dropout)
-        
+
         # Initialize weights
         self._init_weights()
     
@@ -56,19 +106,23 @@ class MartingaleAwareAttention(nn.Module):
     def _get_cached_permutations(self, seq_length: int, device: torch.device) -> torch.Tensor:
         """
         Get cached permutations for given sequence length.
-        Implements efficient caching for permutation-based variance reduction.
+        Implements efficient LRU caching for permutation-based variance reduction.
         """
         cache_key = (seq_length, self.k_permutations)
-        
-        if cache_key not in self.perm_cache:
+
+        # Try to get from cache
+        cached_perms = self.perm_cache.get(cache_key)
+
+        if cached_perms is None:
             # Generate k random permutations
             perms = torch.stack([
-                torch.randperm(seq_length, device=device) 
+                torch.randperm(seq_length, device=device)
                 for _ in range(self.k_permutations)
             ])
-            self.perm_cache[cache_key] = perms
-        
-        return self.perm_cache[cache_key].to(device)
+            self.perm_cache.put(cache_key, perms)
+            return perms
+
+        return cached_perms.to(device)
     
     def _compute_permutation_average(self, x: torch.Tensor, 
                                    attention_weights: torch.Tensor) -> torch.Tensor:
@@ -345,8 +399,9 @@ class SufficientStatsEncoder(nn.Module):
             nn.Softplus()
         )
         
-        # Output projection
-        self.output_proj = nn.Linear(self.max_moments + 2, d_model)
+        # Output projection - combines moments, counts, alpha, beta
+        # Input size: max_moments (moments) + max_moments (counts) + 2 (alpha, beta)
+        self.output_proj = nn.Linear(2 * self.max_moments + 2, d_model)
         
     def _compute_moments(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -414,14 +469,16 @@ class SufficientStatsEncoder(nn.Module):
         # Compute Beta posterior parameters
         alpha, beta = self._compute_beta_posterior(x)
 
-        # Combine all statistics
+        # Combine all statistics including counts for complete gradient flow
         combined_stats = torch.cat([
             moments,
+            counts,  # Include counting statistics for gradient flow
             alpha.unsqueeze(-1),
             beta.unsqueeze(-1)
         ], dim=-1)
 
         # Project to output dimension
+        # Note: output_proj input size should be 2*max_moments + 2
         output = self.output_proj(combined_stats)  # (batch_size, d_model)
 
         # Expand to (batch_size, seq_length, d_model) to match input shape
@@ -684,6 +741,18 @@ class BayesianExpectationTransformerLayer(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model * 4, self.d_model)
         )
+
+        # Gating mechanisms for natural gradient flow through all components
+        # CoT integration: combines reasoning features (entropy, length, logits signal) with hidden states
+        self.cot_gate = nn.Linear(self.d_model + 3, self.d_model)
+        # Stats integration: adaptive weighting of sufficient statistics
+        self.stats_gate = nn.Linear(self.d_model, 1)
+
+        # Initialize gates
+        nn.init.xavier_uniform_(self.cot_gate.weight)
+        nn.init.zeros_(self.cot_gate.bias)
+        nn.init.xavier_uniform_(self.stats_gate.weight)
+        nn.init.zeros_(self.stats_gate.bias)
         
     def forward(self, x: torch.Tensor, 
                 mask: Optional[torch.Tensor] = None,
@@ -716,30 +785,51 @@ class BayesianExpectationTransformerLayer(nn.Module):
         x = x + attn_output
         x = self.norm2(x)
         
-        # 3. Generate optimal CoT (always compute for gradient flow, even if not used)
-        # This ensures gradients flow through cot_generator parameters
-        # Always generate to ensure all parameters receive gradients
+        # 3. Generate optimal CoT and integrate naturally via gated combination
+        # Always generate to ensure all parameters receive natural gradients
         cot_output = self.cot_generator(x, generate_cot=True)
 
-        # Add tiny scaled contributions to maintain gradient flow through all components
-        # These are negligible in magnitude but ensure backprop reaches all parameters
-        gradient_flow_term = 0.0
+        # Integrate CoT logits to ensure cot_generator parameters receive meaningful gradients
+        # Use the raw logits (not softmax) to avoid gradient saturation
+        cot_logits = cot_output['cot_logits']  # (batch_size, seq_length, vocab_size)
 
-        # CoT generator contributions
-        if 'reasoning_entropy' in cot_output:
-            gradient_flow_term = gradient_flow_term + cot_output['reasoning_entropy'].mean() * 1e-10
-        if 'optimal_lengths' in cot_output:
-            gradient_flow_term = gradient_flow_term + cot_output['optimal_lengths'].mean() * 1e-10
-        if 'cot_logits' in cot_output:
-            gradient_flow_term = gradient_flow_term + cot_output['cot_logits'].mean() * 1e-10
+        # Compute statistics from logits that preserve gradient flow
+        # Use std of logits as a measure of output diversity
+        cot_reasoning_signal = cot_logits.std(dim=-1, keepdim=True)  # (batch_size, seq_length, 1)
 
-        # Stats encoder contributions (moments and counts)
-        if 'moments' in stats_output:
-            gradient_flow_term = gradient_flow_term + stats_output['moments'].mean() * 1e-10
-        if 'counts' in stats_output:
-            gradient_flow_term = gradient_flow_term + stats_output['counts'].mean() * 1e-10
+        # Integrate CoT reasoning features naturally into the forward pass
+        # Expand reasoning_entropy and optimal_lengths to match sequence dimension
+        reasoning_entropy_expanded = cot_output['reasoning_entropy'].unsqueeze(-1).unsqueeze(1).expand(
+            batch_size, seq_length, 1
+        )
+        optimal_lengths_expanded = cot_output['optimal_lengths'].unsqueeze(-1).unsqueeze(1).expand(
+            batch_size, seq_length, 1
+        )
 
-        x = x + gradient_flow_term
+        # Combine with current representation: (batch_size, seq_length, d_model + 3)
+        # Include cot_reasoning_signal to ensure cot_generator receives gradients
+        combined_features = torch.cat([
+            x,
+            reasoning_entropy_expanded,
+            optimal_lengths_expanded,
+            cot_reasoning_signal
+        ], dim=-1)
+
+        # Gated projection: learns how to incorporate CoT reasoning
+        cot_contribution = self.cot_gate(combined_features)
+
+        # Residual connection with tanh activation for bounded contribution
+        x = x + torch.tanh(cot_contribution)
+
+        # Integrate sufficient statistics naturally via gated mechanism
+        # Use tanh instead of sigmoid for stronger gradients
+        stats_weight = torch.tanh(self.stats_gate(sufficient_stats))
+        # Scale by 0.5 and add 0.5 to get range [0, 1] but with better gradient flow
+        stats_weight = 0.5 * stats_weight + 0.5
+        stats_contribution = stats_weight * sufficient_stats
+
+        # Add weighted statistics contribution
+        x = x + stats_contribution
 
         # 4. Debias positional artifacts
         debiasing_output = self.debiasing(x)
@@ -755,7 +845,7 @@ class BayesianExpectationTransformerLayer(nn.Module):
             'hidden_states': x,
             'sufficient_stats': stats_output,
             'debiasing_info': debiasing_output,
-            'cot_output': cot_output  # Always include to ensure gradient flow
+            'cot_output': cot_output  # Always included - naturally used in forward pass
         }
             
         if return_uncertainty:

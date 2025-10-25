@@ -1,9 +1,10 @@
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
-from bayesian_transformer import (
+from src.bayesian_transformer import (
     MartingaleAwareAttention,
     OptimalCoTLayer,
     SufficientStatsEncoder,
@@ -43,17 +44,48 @@ class TestMartingaleAwareAttention:
         """Test that permutation caching works correctly."""
         d_model, n_heads = 512, 8
         seq_length = 64
-        
+
         layer = MartingaleAwareAttention(d_model, n_heads)
         device = torch.device('cpu')
-        
+
         # First call should create cache
         perms1 = layer._get_cached_permutations(seq_length, device)
         assert perms1.shape == (layer.k_permutations, seq_length)
-        
+
         # Second call should use cache
         perms2 = layer._get_cached_permutations(seq_length, device)
         assert torch.equal(perms1, perms2)
+
+    def test_lru_cache_eviction(self):
+        """Test that LRU cache evicts old entries when full."""
+        d_model, n_heads = 64, 4
+        cache_maxsize = 3
+
+        attention = MartingaleAwareAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            cache_maxsize=cache_maxsize
+        )
+
+        # Add more than maxsize entries by processing different sequence lengths
+        seq_lengths = [16, 32, 64, 128, 256]
+        for seq_len in seq_lengths:
+            x = torch.randn(2, seq_len, d_model)
+            _ = attention(x)
+
+        # Check cache size is limited to maxsize
+        assert len(attention.perm_cache.cache) <= cache_maxsize
+
+        # Verify most recent entries are retained
+        # The last 3 sequence lengths should be in cache
+        recent_keys = [(seq_len, attention.k_permutations) for seq_len in seq_lengths[-cache_maxsize:]]
+        for key in recent_keys:
+            assert key in attention.perm_cache.cache
+
+        # Verify oldest entries were evicted
+        old_keys = [(seq_len, attention.k_permutations) for seq_len in seq_lengths[:-cache_maxsize]]
+        for key in old_keys:
+            assert key not in attention.perm_cache.cache
         
     def test_adaptive_weighting(self):
         """Test that adaptive weighting follows log(n)/n scaling."""
@@ -501,20 +533,135 @@ class TestBayesianExpectationTransformerLayer:
             'n_heads': 8,
             'vocab_size': 50000
         }
-        
+
         layer = BayesianExpectationTransformerLayer(config)
         batch_size, seq_length = 4, 64
         x = torch.randn(batch_size, seq_length, config['d_model'], requires_grad=True)
-        
+
         output = layer(x)
         loss = output['hidden_states'].sum()
         loss.backward()
-        
+
         # Check that gradients exist for all parameters
         for name, param in layer.named_parameters():
             assert param.grad is not None, f"No gradient for {name}"
             assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
-            
+
+    def test_gradient_flow_comprehensive(self):
+        """Comprehensive test that all components receive meaningful gradients without 1e-10 hacks."""
+        config = {
+            'd_model': 256,  # Smaller for faster testing
+            'n_heads': 4,
+            'vocab_size': 1000
+        }
+
+        layer = BayesianExpectationTransformerLayer(config)
+        batch_size, seq_length = 4, 32
+        x = torch.randn(batch_size, seq_length, config['d_model'], requires_grad=True)
+
+        # Forward pass
+        output = layer(x, generate_cot=True, return_uncertainty=True)
+
+        # Use a more meaningful loss function to ensure stronger gradients
+        # Simulate a classification task with vocab_size classes
+        hidden_states = output['hidden_states']
+        # Add a simple output projection for classification
+        output_proj = nn.Linear(config['d_model'], config['vocab_size'])
+        logits = output_proj(hidden_states)
+        targets = torch.randint(0, config['vocab_size'], (batch_size, seq_length))
+        loss = F.cross_entropy(logits.view(-1, config['vocab_size']), targets.view(-1))
+        loss.backward()
+
+        # Track which components have non-zero gradients
+        component_gradients = {
+            'attention': False,
+            'cot_generator': False,
+            'stats_encoder': False,
+            'debiasing': False,
+            'ffn': False,
+            'cot_gate': False,
+            'stats_gate': False
+        }
+
+        # Check all parameters and categorize by component
+        grad_magnitudes = {}
+        for name, param in layer.named_parameters():
+            # Verify gradient exists and is valid
+            assert param.grad is not None, f"No gradient for {name}"
+            assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+            assert torch.isfinite(param.grad).all(), f"Infinite gradient for {name}"
+
+            # Compute gradient magnitude
+            grad_mag = param.grad.abs().mean().item()
+            grad_magnitudes[name] = grad_mag
+
+            # Check which component this parameter belongs to
+            if 'attention' in name:
+                component_gradients['attention'] = True
+            elif 'cot_generator' in name:
+                component_gradients['cot_generator'] = True
+            elif 'stats_encoder' in name:
+                component_gradients['stats_encoder'] = True
+            elif 'debiasing' in name:
+                component_gradients['debiasing'] = True
+            elif 'ffn' in name:
+                component_gradients['ffn'] = True
+            elif 'cot_gate' in name:
+                component_gradients['cot_gate'] = True
+            elif 'stats_gate' in name:
+                component_gradients['stats_gate'] = True
+
+            # Verify gradient is non-zero (meaningful)
+            # Note: Some parameters like scalar weights may have very small but non-zero gradients
+            if grad_mag == 0:
+                # Only fail if gradient is exactly zero
+                assert False, f"Zero gradient for {name}"
+
+            # Verify gradient magnitude is reasonable (not too large)
+            assert grad_mag < 1e2, f"Gradient too large for {name}: {grad_mag}"
+
+            # For weight matrices, gradients should be non-zero but can vary greatly
+            # depending on initialization and network depth
+            # Main goal: ensure no parameters are completely disconnected (exactly zero gradient)
+
+        # Ensure all components received gradients
+        for component, has_grad in component_gradients.items():
+            assert has_grad, f"Component '{component}' did not receive gradients"
+
+        # Verify CoT generator parameters specifically (previously had gradient flow issues)
+        cot_params = [name for name in grad_magnitudes.keys() if 'cot_generator' in name]
+        assert len(cot_params) > 0, "No CoT generator parameters found"
+
+        for param_name in cot_params:
+            grad_mag = grad_magnitudes[param_name]
+            # CoT gradients should be meaningful (not artificially small like 1e-10 from hack)
+            # Accept gradients > 1e-8 as naturally small but non-zero
+            assert grad_mag > 1e-9, f"CoT parameter '{param_name}' has suspiciously small gradient: {grad_mag}"
+
+        # Verify stats encoder parameters (moments and counts)
+        stats_params = [name for name in grad_magnitudes.keys() if 'stats_encoder' in name]
+        assert len(stats_params) > 0, "No stats encoder parameters found"
+
+        for param_name in stats_params:
+            grad_mag = grad_magnitudes[param_name]
+            # Accept naturally small gradients but ensure they're not from artificial 1e-10 hack
+            assert grad_mag > 1e-9, f"Stats parameter '{param_name}' has suspiciously small gradient: {grad_mag}"
+
+        # Verify new gating mechanisms receive gradients
+        assert any('cot_gate' in name for name in grad_magnitudes.keys()), "CoT gate parameters not found"
+        assert any('stats_gate' in name for name in grad_magnitudes.keys()), "Stats gate parameters not found"
+
+        # Print gradient summary for debugging (will show in pytest -v output)
+        print("\n=== Gradient Flow Summary ===")
+        for component in component_gradients.keys():
+            component_params = {k: v for k, v in grad_magnitudes.items() if component in k}
+            if component_params:
+                avg_grad = sum(component_params.values()) / len(component_params)
+                min_grad = min(component_params.values())
+                max_grad = max(component_params.values())
+                print(f"{component}: {len(component_params)} params, "
+                      f"avg={avg_grad:.2e}, min={min_grad:.2e}, max={max_grad:.2e}")
+
     def test_theoretical_properties(self):
         """Test that layer satisfies theoretical properties."""
         config = {
