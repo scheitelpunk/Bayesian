@@ -1,0 +1,86 @@
+Ich möchte einen PyTorch Layer implementieren, der die theoretischen Erkenntnisse aus "LLMs are Bayesian in Expectation, Not in Realization" nutzt. Der Layer soll folgende Komponenten haben:
+
+### 1. Martingale-Aware Attention Layer
+Erstelle eine modifizierte Attention-Schicht, die:
+- Standard-Attention mit positionalen Encodings durchführt
+- Parallel dazu Permutations-Averaging implementiert (k=20 zufällige Permutationen)
+- Die Outputs intelligent kombiniert, um Martingal-Verletzungen zu reduzieren
+
+```python
+class MartingaleAwareAttention(nn.Module):
+    def __init__(self, d_model, n_heads, k_permutations=20):
+        # Implementiere:
+        # - Standard Multi-Head Attention
+        # - Permutation sampling mechanism
+        # - Variance reduction durch averaging
+        # - Adaptive weighting basierend auf Sequenzlänge n
+2. Optimal Chain-of-Thought Generator
+Implementiere einen Layer, der automatisch die optimale CoT-Länge berechnet:
+pythonclass OptimalCoTLayer(nn.Module):
+    def __init__(self, d_model, vocab_size, L_f=10):
+        # Berechne k* = sqrt(n * alpha / (H_CoT * (B_0 - B_opt))) * log2(1/epsilon)
+        # Mit:
+        # - Adaptive Schätzung von H_CoT (reasoning entropy)
+        # - Dynamische Berechnung basierend auf Input-Komplexität
+        # - Effizienz-Constraints (max tokens, computational budget)
+3. Sufficient Statistics Encoder
+Ein Layer, der explizit suffiziente Statistiken berechnet und nutzt:
+pythonclass SufficientStatsEncoder(nn.Module):
+    def __init__(self, d_model):
+        # Implementiere:
+        # - Counting heads für Bernoulli-ähnliche Sequenzen
+        # - Moment-Berechnung bis Ordnung k = O(log d)
+        # - Beta-Posterior Approximation
+4. Information-Theoretic Regularization
+Füge eine Loss-Komponente hinzu, die MDL-Optimalität fördert:
+pythonclass MDLRegularizedLoss(nn.Module):
+    def __init__(self, beta=0.1):
+        # Loss = Standard_Loss + beta * (actual_complexity - optimal_complexity)
+        # Wobei optimal_complexity = n*H(p) + O(sqrt(n*log(n)))
+5. Debiasing Module für Positional Encodings
+Implementiere die Debiasing-Technik aus dem Paper:
+pythonclass PositionalDebiasing(nn.Module):
+    def __init__(self, d_model, encoding_type='rotary'):
+        # - Erkennung periodischer Artefakte (z.B. 64-Token Periode)
+        # - Multi-harmonische Modellierung
+        # - Adaptive Korrektur ohne Verlust der Positions-Information
+Integration:
+Kombiniere alle Komponenten in einem Gesamt-Layer:
+pythonclass BayesianExpectationTransformerLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attention = MartingaleAwareAttention(...)
+        self.cot_generator = OptimalCoTLayer(...)
+        self.stats_encoder = SufficientStatsEncoder(...)
+        self.debiasing = PositionalDebiasing(...)
+        
+    def forward(self, x, return_uncertainty=False):
+        # 1. Berechne suffiziente Statistiken
+        # 2. Wende Martingale-aware attention an
+        # 3. Generiere optimale CoT wenn nötig
+        # 4. Debiase positional artifacts
+        # 5. Optional: Returne kalibrierte Unsicherheitsschätzungen
+Zusätzliche Anforderungen:
+
+Implementiere Caching für Permutations-Berechnungen
+Nutze die log(n)/n Skalierung für adaptive Parameter
+Implementiere die Variance-Reduction Formel aus Proposition 3.10
+Füge Monitoring für Martingal-Verletzungen hinzu
+Optimiere für Inferenz-Geschwindigkeit bei Beibehaltung der theoretischen Garantien
+
+Testing:
+Erstelle Unit-Tests, die verifizieren:
+
+Martingal-Verletzungen folgen Θ(log n/n)
+Compression efficiency erreicht 99% des theoretischen Limits
+CoT-Länge folgt k* = Θ(√n log(1/ε))
+Permutations-Averaging reduziert Varianz um Faktor √k
+
+Bitte implementiere diese Komponenten mit ausführlichen Kommentaren, die die theoretischen Grundlagen erklären. Der Code soll production-ready sein mit:
+
+Minimal overhead
+Kompatibilität mit HuggingFace Transformers
+Clear API für Integration in bestehende Pipelines
+Beispiele für GPT, BERT, und T5 Modelle
+Ausführliche Dokumentation
+Testsuite mit größer 90% Abdeckung
