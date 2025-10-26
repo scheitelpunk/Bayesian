@@ -25,8 +25,8 @@ class LearnedPermutationGenerator(nn.Module):
         n_positions: int,
         k_permutations: int,
         temperature: float = 1.0,
-        min_temperature: float = 0.5,
-        anneal_rate: float = 0.0003
+        min_temperature: float = 0.3,
+        anneal_rate: float = 0.03
     ):
         """
         Args:

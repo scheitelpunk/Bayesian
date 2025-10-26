@@ -157,18 +157,34 @@ class BayesianTransformerWrapper(nn.Module):
         if return_uncertainty and isinstance(outputs, dict):
             # Extract uncertainty from the outputs
             uncertainty = outputs.get('uncertainty', {})
-            epistemic = uncertainty.get('epistemic', torch.zeros(batch_size, seq_len, device=x.device))
-            aleatoric = uncertainty.get('aleatoric', torch.zeros(batch_size, seq_len, device=x.device))
 
-            # Average over sequence length
-            epistemic_avg = epistemic.mean(dim=1) if epistemic.dim() > 1 else epistemic
-            aleatoric_avg = aleatoric.mean(dim=1) if aleatoric.dim() > 1 else aleatoric
+            # Handle both improved stats encoder (total) and original (epistemic/aleatoric)
+            if 'total' in uncertainty:
+                # Improved stats encoder v2 returns only 'total' uncertainty
+                total_unc = uncertainty['total']
+                # Average over sequence length if needed
+                if total_unc.dim() > 1:
+                    total_unc = total_unc.mean(dim=1)
 
-            return {
-                'logits': logits,
-                'epistemic_uncertainty': epistemic_avg,
-                'aleatoric_uncertainty': aleatoric_avg
-            }
+                return {
+                    'logits': logits,
+                    'epistemic_uncertainty': total_unc,  # Use total as epistemic
+                    'aleatoric_uncertainty': torch.zeros_like(total_unc)
+                }
+            else:
+                # Original format with separate epistemic/aleatoric
+                epistemic = uncertainty.get('epistemic', torch.zeros(batch_size, seq_len, device=x.device))
+                aleatoric = uncertainty.get('aleatoric', torch.zeros(batch_size, seq_len, device=x.device))
+
+                # Average over sequence length
+                epistemic_avg = epistemic.mean(dim=1) if epistemic.dim() > 1 else epistemic
+                aleatoric_avg = aleatoric.mean(dim=1) if aleatoric.dim() > 1 else aleatoric
+
+                return {
+                    'logits': logits,
+                    'epistemic_uncertainty': epistemic_avg,
+                    'aleatoric_uncertainty': aleatoric_avg
+                }
         elif return_uncertainty:
             return {
                 'logits': logits,
@@ -346,8 +362,8 @@ class TransformerBenchmark:
                             epoch_aux_losses[loss_name] = []
                         epoch_aux_losses[loss_name].append(loss_value.item())
 
-                # Total loss
-                loss = classification_loss + 0.01 * total_aux_loss  # Weight auxiliary losses
+                # Total loss (auxiliary loss weighted at 5% to encourage permutation learning)
+                loss = classification_loss + 0.05 * total_aux_loss  # CHANGED: 0.01 → 0.05
 
                 loss.backward()
                 optimizer.step()
@@ -417,6 +433,7 @@ class TransformerBenchmark:
         all_errors = []
 
         inference_times = []
+        first_batch_logged = False
 
         with torch.no_grad():
             for batch_x, batch_y in test_loader:
@@ -432,7 +449,12 @@ class TransformerBenchmark:
                 # Handle dict output
                 if isinstance(outputs, dict):
                     logits = outputs['logits']
-                    uncertainties = outputs['epistemic_uncertainty'].cpu().numpy()
+                    # Try to get epistemic uncertainty, fallback to zeros
+                    epistemic_unc = outputs.get('epistemic_uncertainty', None)
+                    if epistemic_unc is not None:
+                        uncertainties = epistemic_unc.cpu().numpy()
+                    else:
+                        uncertainties = np.zeros(batch_y.size(0))
                 else:
                     logits = outputs
                     uncertainties = np.zeros(batch_y.size(0))
@@ -445,6 +467,18 @@ class TransformerBenchmark:
 
                 all_uncertainties.extend(uncertainties)
                 all_errors.extend(errors)
+
+                # Debug: Log first batch uncertainty info
+                if not first_batch_logged and model_name == "Bayesian Transformer":
+                    print(f"\n[DEBUG] First batch uncertainty check:")
+                    print(f"  - Output type: {type(outputs)}")
+                    if isinstance(outputs, dict):
+                        print(f"  - Dict keys: {outputs.keys()}")
+                        print(f"  - Uncertainty shape: {epistemic_unc.shape if epistemic_unc is not None else 'None'}")
+                        print(f"  - Uncertainty mean: {uncertainties.mean():.6f}")
+                        print(f"  - Uncertainty std: {uncertainties.std():.6f}")
+                        print(f"  - Uncertainty min/max: [{uncertainties.min():.6f}, {uncertainties.max():.6f}]")
+                    first_batch_logged = True
 
         final_accuracy = correct / total
         avg_inference_time = np.mean(inference_times)
