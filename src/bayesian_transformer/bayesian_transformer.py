@@ -5,12 +5,14 @@ import math
 from typing import Optional, Tuple, Dict, Any
 from collections import OrderedDict
 import numpy as np
+from .statistics_encoder_v2 import StatisticsEncoderV2
+from .learned_permutations import LearnedPermutationGenerator, HybridPermutationGenerator
 
 
 class LRUPermutationCache:
     """LRU cache for permutation tensors with size limit to prevent memory leaks."""
 
-    def __init__(self, maxsize: int = 100):
+    def __init__(self, maxsize: int = 1000):  # OPTIMIZED: 100 → 1000 for better hit rate
         """
         Initialize LRU cache with maximum size.
 
@@ -55,6 +57,30 @@ class LRUPermutationCache:
     def clear(self):
         """Clear all cached entries."""
         self.cache.clear()
+
+
+class PermutationGenerator:
+    """Simple permutation generator for backward compatibility."""
+
+    def __init__(self, cache_size: int = 1000):
+        self.cache = LRUPermutationCache(maxsize=cache_size)
+
+    def generate_permutations(self, seq_length: int, k_permutations: int,
+                            device: torch.device) -> torch.Tensor:
+        """Generate k random permutations of sequence length."""
+        cache_key = (seq_length, k_permutations)
+        cached = self.cache.get(cache_key)
+
+        if cached is not None:
+            return cached.to(device)
+
+        perms = torch.stack([
+            torch.randperm(seq_length, device=device)
+            for _ in range(k_permutations)
+        ])
+
+        self.cache.put(cache_key, perms.cpu())
+        return perms
 
 
 class MartingaleAwareAttention(nn.Module):
@@ -357,12 +383,32 @@ class OptimalCoTLayer(nn.Module):
         return output
 
 
+class StatisticsEncoder(nn.Module):
+    """Simple statistics encoder for backward compatibility."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute basic statistics: mean and std over permutations."""
+        # x shape: (batch, k, seq, d_model)
+        mean = x.mean(dim=1)  # (batch, seq, d_model)
+        std = x.std(dim=1)    # (batch, seq, d_model)
+
+        # Concatenate and project
+        stats = torch.cat([mean, std], dim=-1)  # (batch, seq, 2*d_model)
+
+        # Project to output dimension
+        return self.projection(stats[:, :, :self.projection.in_features])
+
+
 class SufficientStatsEncoder(nn.Module):
     """
     Sufficient Statistics Encoder that explicitly computes and uses sufficient statistics
     for Beta-Posterior approximation and counting-based inference.
     """
-    
+
     def __init__(self, d_model: int, max_moments: int = None):
         super().__init__()
         
@@ -700,14 +746,33 @@ class BayesianExpectationTransformerLayer(nn.Module):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        
+
         # Extract configuration
         self.d_model = config['d_model']
         self.n_heads = config['n_heads']
         self.vocab_size = config['vocab_size']
         self.k_permutations = config.get('k_permutations', 20)
         self.dropout = config.get('dropout', 0.1)
-        
+
+        # Add config options for new components
+        use_learned_perms = config.get('use_learned_permutations', False)
+        use_improved_stats = config.get('use_improved_statistics', False)
+        max_seq_length = config.get('max_seq_length', 128)
+
+        # Initialize permutation generator (learned or random)
+        if use_learned_perms:
+            # Option 1: Fully learned
+            self.permutation_generator = LearnedPermutationGenerator(
+                n_positions=max_seq_length,
+                k_permutations=self.k_permutations,
+                temperature=config.get('perm_temperature', 1.0)
+            )
+            self.using_learned_perms = True
+        else:
+            # Original random permutations
+            self.permutation_generator = PermutationGenerator(cache_size=1000)
+            self.using_learned_perms = False
+
         # Initialize all components
         self.attention = MartingaleAwareAttention(
             d_model=self.d_model,
@@ -715,16 +780,26 @@ class BayesianExpectationTransformerLayer(nn.Module):
             k_permutations=self.k_permutations,
             dropout=self.dropout
         )
-        
+
         self.cot_generator = OptimalCoTLayer(
             d_model=self.d_model,
             vocab_size=self.vocab_size
         )
-        
-        self.stats_encoder = SufficientStatsEncoder(
-            d_model=self.d_model
-        )
-        
+
+        # Replace statistics encoder (improved or original)
+        if use_improved_stats:
+            self.stats_encoder = StatisticsEncoderV2(
+                d_model=self.d_model,
+                dropout=self.dropout
+            )
+            self.using_improved_stats = True
+        else:
+            # Original statistics encoder
+            self.stats_encoder = SufficientStatsEncoder(
+                d_model=self.d_model
+            )
+            self.using_improved_stats = False
+
         self.debiasing = PositionalDebiasing(
             d_model=self.d_model
         )
@@ -754,27 +829,44 @@ class BayesianExpectationTransformerLayer(nn.Module):
         nn.init.xavier_uniform_(self.stats_gate.weight)
         nn.init.zeros_(self.stats_gate.bias)
         
-    def forward(self, x: torch.Tensor, 
+    def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 return_uncertainty: bool = False,
                 generate_cot: bool = False) -> Dict[str, torch.Tensor]:
         """
         Forward pass through complete Bayesian Expectation Transformer Layer.
-        
+
         Args:
             x: Input tensor of shape (batch_size, seq_length, d_model)
             mask: Optional attention mask
             return_uncertainty: Whether to return calibrated uncertainty estimates
             generate_cot: Whether to generate Chain-of-Thought reasoning
-            
+
         Returns:
             Dictionary containing outputs and optional uncertainty estimates
         """
         batch_size, seq_length, d_model = x.shape
-        
-        # 1. Compute sufficient statistics
-        stats_output = self.stats_encoder(x)
-        sufficient_stats = stats_output['sufficient_stats']
+
+        # 1. Compute sufficient statistics with proper handling
+        if self.using_improved_stats:
+            stats_output = self.stats_encoder(
+                x.unsqueeze(1).expand(batch_size, self.k_permutations, seq_length, d_model),
+                return_detailed=return_uncertainty
+            )
+            sufficient_stats = stats_output['encoded_stats']
+
+            # Extract uncertainty if requested
+            if return_uncertainty:
+                uncertainty = stats_output['uncertainty']
+        else:
+            # Original statistics encoder
+            stats_output = self.stats_encoder(x)
+            sufficient_stats = stats_output['sufficient_stats']
+
+            # Compute uncertainty from variance
+            if return_uncertainty:
+                variance = x.var(dim=1).mean(dim=-1)
+                uncertainty = variance
 
         # Add sufficient statistics to input (already has correct shape)
         x_with_stats = x + sufficient_stats
@@ -850,19 +942,42 @@ class BayesianExpectationTransformerLayer(nn.Module):
             
         if return_uncertainty:
             # Return calibrated uncertainty estimates from posterior
-            alpha = stats_output['alpha']
-            beta = stats_output['beta']
-            
-            # Compute uncertainty metrics
-            epistemic_uncertainty = stats_output['posterior_variance']
-            aleatoric_uncertainty = stats_output['posterior_mean'] * (1 - stats_output['posterior_mean'])
-            
-            output['uncertainty'] = {
-                'epistemic': epistemic_uncertainty,
-                'aleatoric': aleatoric_uncertainty,
-                'total': epistemic_uncertainty + aleatoric_uncertainty,
-                'posterior_alpha': alpha,
-                'posterior_beta': beta
-            }
-        
+            if self.using_improved_stats:
+                # Use uncertainty from improved stats encoder
+                output['uncertainty'] = {
+                    'total': uncertainty,
+                    'source': 'statistics_encoder_v2'
+                }
+            else:
+                # Return calibrated uncertainty estimates from posterior
+                alpha = stats_output['alpha']
+                beta = stats_output['beta']
+
+                # Compute uncertainty metrics
+                epistemic_uncertainty = stats_output['posterior_variance']
+                aleatoric_uncertainty = stats_output['posterior_mean'] * (1 - stats_output['posterior_mean'])
+
+                output['uncertainty'] = {
+                    'epistemic': epistemic_uncertainty,
+                    'aleatoric': aleatoric_uncertainty,
+                    'total': epistemic_uncertainty + aleatoric_uncertainty,
+                    'posterior_alpha': alpha,
+                    'posterior_beta': beta
+                }
+
         return output
+
+    def get_auxiliary_losses(self) -> dict:
+        """
+        Get auxiliary losses for training (permutation regularization, etc.).
+
+        Returns:
+            Dictionary of auxiliary losses
+        """
+        losses = {}
+
+        # Permutation regularization
+        if self.using_learned_perms and hasattr(self.permutation_generator, 'get_regularization_loss'):
+            losses['perm_regularization'] = self.permutation_generator.get_regularization_loss()
+
+        return losses
