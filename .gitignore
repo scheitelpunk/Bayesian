@@ -169,7 +169,6 @@ pretrained/
 logs/
 runs/
 outputs/
-results/
 experiments/
 tensorboard/
 wandb/
