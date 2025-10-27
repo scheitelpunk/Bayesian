@@ -2,6 +2,12 @@
 
 A PyTorch implementation of Bayesian neural network principles applied to transformer architectures, achieving **14.1% higher accuracy** than standard transformers while providing calibrated uncertainty estimates.
 
+**Inspired by**: [LLMs are Bayesian, in Expectation, not in Realization](https://arxiv.org/abs/2507.11768) by Leon Chlon, Sarah Rashidi, Zein Khamis, and MarcAntonio M. Awada
+
+**Author**: Michael Neuberger
+**Organization**: Versino PsiOmega GmbH
+**License**: MIT
+
 ## 🎯 Key Results
 
 | Metric | Standard Transformer | Bayesian Transformer | Improvement |
@@ -36,8 +42,8 @@ This implementation provides a production-ready Bayesian transformer layer that:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/bayesian-transformer.git
-cd bayesian-transformer
+git clone https://github.com/scheitelpunk/Bayesian-Expectation-Transformer.git
+cd Bayesian-Expectation-Transformer
 
 # Install dependencies
 pip install -r requirements.txt
@@ -494,9 +500,25 @@ If you use this implementation in your research, please cite:
 ```bibtex
 @software{bayesian_transformer_2025,
   title={Bayesian Expectation Transformer: End-to-End Trainable Bayesian Neural Networks for Transformers},
-  author={Your Name},
+  author={Michael Neuberger},
+  organization={Versino PsiOmega GmbH},
   year={2025},
-  url={https://github.com/yourusername/bayesian-transformer}
+  url={https://github.com/scheitelpunk/Bayesian-Expectation-Transformer}
+}
+```
+
+And please also cite the original inspiration:
+
+```bibtex
+@article{chlon2025llms,
+  title={LLMs are Bayesian, in Expectation, not in Realization},
+  author={Chlon, Leon and Rashidi, Sarah and Khamis, Zein and Awada, MarcAntonio M.},
+  journal={arXiv preprint arXiv:2507.11768},
+  year={2025},
+  eprint={2507.11768},
+  archivePrefix={arXiv},
+  primaryClass={stat.ML},
+  doi={10.48550/arXiv.2507.11768}
 }
 ```
 
@@ -506,13 +528,36 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-- Inspired by the paper "LLMs are Bayesian in Expectation, Not in Realization"
+### Special Thanks
+
+This project was inspired by and builds upon the groundbreaking work:
+
+**"LLMs are Bayesian, in Expectation, not in Realization"**
+Leon Chlon, Sarah Rashidi, Zein Khamis, MarcAntonio M. Awada
+arXiv:2507.11768 [stat.ML], 2025
+https://arxiv.org/abs/2507.11768
+https://doi.org/10.48550/arXiv.2507.11768
+
+Leon's research demonstrates that transformers achieve information-theoretic optimality with Bayesian inference in expectation over orderings, while systematically violating the martingale property. This theoretical foundation inspired our end-to-end trainable implementation.
+
+### Key Differences
+
+While Leon's work provides theoretical analysis of implicit Bayesian inference in transformers, this implementation:
+- Integrates Bayesian principles during training (end-to-end trainable)
+- Uses learned permutations for implicit regularization
+- Achieves both higher accuracy (+14.1%) AND uncertainty quantification
+
+Both approaches are complementary: HallBayes for existing models, this for training new models.
+
+### Other Acknowledgments
+
 - Built with PyTorch and HuggingFace Transformers
 - IMDB dataset from Stanford AI Lab
+- Calibration methods inspired by scikit-learn
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/bayesian-transformer/issues)
+- **Issues**: [GitHub Issues](https://github.com/scheitelpunk/Bayesian-Expectation-Transformer/issues)
 - **Documentation**: [docs/](docs/)
 - **Examples**: [examples/](examples/)
 

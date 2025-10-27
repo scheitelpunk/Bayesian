@@ -374,5 +374,6 @@ Use `should_route_to_human` field for production workflows.
 ## Support
 
 For issues or questions:
-- GitHub: https://github.com/yourusername/bayesian-transformer
+- GitHub: https://github.com/scheitelpunk/Bayesian-Expectation-Transformer
+- Email: neuberger@versino.de
 - Documentation: See `docs/` directory
